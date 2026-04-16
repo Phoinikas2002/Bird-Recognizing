@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import base64
 import io
 import json
 import logging
 import os
 import re
+import threading
 import urllib.error
 import urllib.request
 import uuid
@@ -15,7 +17,7 @@ from pathlib import Path as FilePath
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from fastapi import FastAPI, File, HTTPException, Path as ApiPath, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Path as ApiPath, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from PIL import Image
@@ -177,6 +179,8 @@ class KnowledgeAgent:
         self.base_url = QWEN_BASE_URL.rstrip("/")
         self.model = QWEN_MODEL
         self.timeout = max(5, int(QWEN_TIMEOUT))
+        self.review_log_path = BASE_DIR / "logs" / "recognition_review.log"
+        self._review_log_lock = threading.Lock()
 
     def _fallback_payload(self, species: str, recognition: Dict[str, Any]) -> Dict[str, Any]:
         top_3 = recognition.get("top_3", [])
@@ -262,6 +266,111 @@ class KnowledgeAgent:
         parsed.setdefault("model", self.model)
         parsed.setdefault("enabled", True)
         return parsed
+
+    def _build_review_prompt(self, file_name: str, recognition: Dict[str, Any]) -> str:
+        top_1 = recognition.get("top_1", {})
+        top_3 = recognition.get("top_3", [])
+        top_lines = [
+            f"- {item.get('species', 'Unknown Species')}: {_safe_float(item.get('confidence', 0.0) * 100, 1)}%"
+            for item in top_3
+        ]
+        return (
+            "You are a strict bird-recognition quality reviewer."
+            " Evaluate whether the predicted species is likely correct based on the image and candidate ranking.\n"
+            "Return JSON only with fields: verdict, reason.\n"
+            "Allowed verdict values: recognize right, recognize wrong, uncertain.\n"
+            f"File name: {file_name}\n"
+            f"Top-1 prediction: {top_1.get('species', 'Unknown Species')}\n"
+            f"Top-1 confidence: {_safe_float(top_1.get('confidence', 0.0) * 100, 1)}%\n"
+            "Top-3 candidates:\n"
+            + "\n".join(top_lines)
+        )
+
+    def _compress_review_image(self, image_bytes: bytes) -> bytes:
+        try:
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            image.thumbnail((768, 768))
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=85, optimize=True)
+            return buffer.getvalue()
+        except Exception:
+            return image_bytes
+
+    def _normalize_review_verdict(self, verdict: str) -> str:
+        normalized = (verdict or "").strip().lower()
+        if "wrong" in normalized or "incorrect" in normalized or "错误" in normalized:
+            return "recognize wrong"
+        if "right" in normalized or "correct" in normalized or "正确" in normalized:
+            return "recognize right"
+        return "uncertain"
+
+    def _call_qwen_review(self, image_bytes: bytes, file_name: str, recognition: Dict[str, Any]) -> str:
+        prompt = self._build_review_prompt(file_name, recognition)
+        review_image_bytes = self._compress_review_image(image_bytes)
+        encoded_image = base64.b64encode(review_image_bytes).decode("utf-8")
+
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": "你只返回 JSON。"},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded_image}"}},
+                    ],
+                },
+            ],
+            "temperature": 0.0,
+        }
+        request = urllib.request.Request(
+            f"{self.base_url}/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {QWEN_API_KEY}",
+            },
+            method="POST",
+        )
+
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+
+        content = response_payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if isinstance(content, list):
+            content = "\n".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
+
+        parsed = _extract_json_block(str(content))
+        if isinstance(parsed, dict):
+            return self._normalize_review_verdict(str(parsed.get("verdict", "")))
+
+        raw_text = str(content).lower()
+        if "recognize wrong" in raw_text:
+            return "recognize wrong"
+        if "recognize right" in raw_text:
+            return "recognize right"
+        return "uncertain"
+
+    def _append_review_log(self, file_name: str, verdict: str) -> None:
+        safe_name = (file_name or "unknown.png").strip() or "unknown.png"
+        self.review_log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_line = f"{safe_name}: {verdict}\n"
+        with self._review_log_lock:
+            with self.review_log_path.open("a", encoding="utf-8") as log_handle:
+                log_handle.write(log_line)
+
+    def review_and_log(self, image_bytes: bytes, file_name: str, recognition: Dict[str, Any]) -> None:
+        if not self.enabled:
+            self._append_review_log(file_name, "uncertain")
+            return
+
+        try:
+            verdict = self._call_qwen_review(image_bytes, file_name, recognition)
+        except Exception as exc:
+            logger.warning("Qwen review task failed: %s", exc)
+            verdict = "uncertain"
+
+        self._append_review_log(file_name, verdict)
 
     def enrich(self, species: str, recognition: Dict[str, Any]) -> Dict[str, Any]:
         if not self.enabled:
@@ -486,8 +595,8 @@ async def get_info():
 
 
 @app.post("/api/analyze")
-async def analyze(file: UploadFile = File(...)):
-    return await _analyze_upload(file, include_agent=True)
+async def analyze(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    return await _analyze_upload(file, include_agent=True, background_tasks=background_tasks)
 
 
 @app.post("/api/predict")
@@ -495,7 +604,7 @@ async def predict(file: UploadFile = File(...)):
     return await _analyze_upload(file, include_agent=False)
 
 
-async def _analyze_upload(file: UploadFile, include_agent: bool):
+async def _analyze_upload(file: UploadFile, include_agent: bool, background_tasks: Optional[BackgroundTasks] = None):
     try:
         if file.content_type not in ALLOWED_MIME_TYPES:
             raise HTTPException(status_code=400, detail=f"不支持的文件格式。支持: JPEG, PNG, WebP。接收到: {file.content_type}")
@@ -535,6 +644,15 @@ async def _analyze_upload(file: UploadFile, include_agent: bool):
                 "summary": summary,
             },
         }
+
+        if include_agent and background_tasks is not None:
+            background_tasks.add_task(
+                manager.agent.review_and_log,
+                contents,
+                file.filename or "unknown.png",
+                recognition,
+            )
+
         return JSONResponse(content=payload)
     except HTTPException:
         raise
